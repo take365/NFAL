@@ -1,0 +1,229 @@
+# codexCLI – EDINET Fetch Module Design
+
+**Project:** NFAL (Narrative Financial Analysis with LLM)
+**Component:** `codexcli.edinet.fetch`
+**Author:** <your-name>
+**Version:** 0.1
+**Date:** 2025-09-19 (JST)
+
+---
+
+## 1. Purpose
+
+EDINET コード（例: `E05907`）をキーに、**直近2期の有価証券報告書**（docTypeCode=120）を自動取得し、代表版（訂正があれば最新版）を選定して、**`output/<EDINET_CODE>/`** に **JSON** として保存する。NFAL の定性分析パイプラインの前段（取得→正規化）を担う。
+
+---
+
+## 2. Inputs / Outputs
+
+### 2.1 Inputs
+
+* **EDINET Code**: `E\d{5}`（例: `E05907`）
+* **.env**: `APIKEY=<your_api_key>`
+* **CLI args** (例):
+
+  * `--edinet E05907`
+  * `--from 2023-01-01` *(任意 / 既定は 3 年前)*
+  * `--to 2025-09-19` *(任意 / 既定は 今日)*
+  * `--prefer consolidated|separate` *(既定: consolidated)*
+
+### 2.2 Outputs
+
+* ディレクトリ: `output/<EDINET_CODE>/`
+* ファイル:
+
+  * `yuho_latest.json`（直近期）
+  * `yuho_previous.json`（前期）
+  * `index.json`（メタ一覧: 収集時刻、docID、選定理由など）
+
+---
+
+## 3. External Docs / References
+
+* `EDINET_API_Spec_v2_202506.pdf`（旧: ESE140206.pdf）
+* `EDINET_Guide_202503.pdf`（旧: ESE140102.pdf）
+* （任意）`EDINET_Document_List_Examples.xlsx` / `EDINET_Submission_Data_Examples.xlsx`
+
+---
+
+## 4. API Endpoints (v2)
+
+* **Document list**: `GET https://disclosure2dl.edinet-fsa.go.jp/api/v2/documents.json`
+
+  * Query params: `from`, `to`, `edinetCode`
+* **Document download**: `GET https://disclosure2dl.edinet-fsa.go.jp/api/v2/documents/{docID}`
+
+  * `type=1` ZIP (iXBRL/HTML 等まとめ)
+  * `type=2` PDF（ある場合）
+
+> 認証: HTTP ヘッダ `X-API-KEY: $APIKEY`（.env から読込）
+
+---
+
+## 5. Selection Logic ("Latest 2 Yuho")
+
+1. **List**: `documents.json` を `from=3年前`, `to=今日`, `edinetCode=<E_CODE>` で取得。
+2. **Filter**:
+
+   * `docTypeCode == "120"`（有価証券報告書）
+   * `withdrawalStatus == 0`（取下げ除外）
+3. **Group by Period**:
+
+   * キー: `(periodStart, periodEnd, consolidatedFlag)`
+   * 同一期に **原本** と **訂正** が複数ある場合：`submitDateTime` 降順の **最新** を代表に選定。
+4. **Sort**:
+
+   * `periodEnd` 降順に並べ、**上位2期**を選択（= latest / previous）。
+5. **Prefer Consolidated**:
+
+   * 同一期間に連結/個別が併存する場合、CLI の `--prefer` に従い選択（既定: 連結優先）。
+
+> エッジケース: 期の重複や `periodEnd` 欠落時は `submitDateTime` で代補。訂正は常に最新版で置換。
+
+---
+
+## 6. Download & Normalize
+
+* **Download**: 代表2件の `docID` を用いて `type=1` を取得（ZIP）。
+* **Extract**: ZIP から iXBRL/HTML 本文を展開し、以下のセクションを抽出（正規表現/タグ）：
+
+  * `ManagementPolicy`（経営方針）
+  * `BusinessRisk`（事業等のリスク）
+  * `KAM`（監査上の主要な検討事項、監査報告書）
+  * `Governance`（コーポレートガバナンス）
+  * `ESG`（サステナビリティ関連）
+  * `Meta`（docID, periodStart/End, submitDateTime, amendFlag, consolidatedFlag, filerName 等）
+* **Serialize**: 上記を UTF-8 の JSON で保存。
+
+### 6.1 JSON Schema (simplified)
+
+```json
+{
+  "meta": {
+    "edinetCode": "E05907",
+    "filerName": "...",
+    "docID": "S100XXXX",
+    "docTypeCode": "120",
+    "consolidatedFlag": "consolidated|separate|unknown",
+    "periodStart": "YYYY-MM-DD",
+    "periodEnd": "YYYY-MM-DD",
+    "submitDateTime": "YYYY-MM-DDThh:mm:ssZ",
+    "amendFlag": 0,
+    "representativeOfPeriod": true
+  },
+  "sections": {
+    "managementPolicy": "...",
+    "businessRisk": "...",
+    "kam": [{"matter": "...", "why": "...", "response": "..."}],
+    "governance": "...",
+    "esg": "..."
+  },
+  "source": {
+    "listApiQuery": "from=...&to=...&edinetCode=...",
+    "download": {"type": 1, "url": ".../{docID}?type=1"},
+    "hashes": {"zip": "sha256:...", "extractedFiles": {"...": "sha256:..."}}
+  }
+}
+```
+
+---
+
+## 7. CLI Specification
+
+```
+codexcli edinet fetch \
+  --edinet E05907 \
+  [--from 2023-01-01] \
+  [--to 2025-09-19] \
+  [--prefer consolidated|separate] \
+  [--outdir output]
+```
+
+* 既定値:
+
+  * `from`: 今日から遡って 3 年（`today - 3y`）
+  * `to`: 今日
+  * `prefer`: `consolidated`
+  * `outdir`: `output`
+
+* 実行例:
+
+```
+codexcli edinet fetch --edinet E05907
+```
+
+---
+
+## 8. Env / Config
+
+* `.env` から `APIKEY` をロード。見つからない場合は明示エラー。
+* リクエストヘッダ: `X-API-KEY: $APIKEY`
+* タイムアウト: 30s / リトライ: 指数バックオフ（HTTP 429, 5xx）
+* レート制御: 2 req/s 目安（API仕様に合わせ調整）
+
+---
+
+## 9. Error Handling & Logging
+
+* **Validation**: EDINETコード形式不一致 → 即時エラー（exit code 2）
+* **HTTP**: 4xx/5xx → 再試行（最大3回）。429 は `Retry-After` 準拠。
+* **NoDocs**: フィルタ後に対象なし → `index.json` に理由を記録し、終了コード 0（正常）
+* **Partial**: latest は取得、previous なし → available 分のみ保存し警告ログ
+* **Audit Log**: `index.json` に収集時刻、クエリ、docID一覧、選定ロジックの結果を保存
+
+---
+
+## 10. Directory & Files
+
+```
+output/
+  E05907/
+    yuho_latest.json
+    yuho_previous.json
+    index.json
+```
+
+---
+
+## 11. Parsing Notes (iXBRL/HTML)
+
+* 文字コードは UTF-8 優先。BOM/混在に注意。
+* iXBRL タグ（`ix:nonFraction`, `ix:nonNumeric`）からテキスト抽出。
+* HTML セクション見出し（見出し語彙の揺れ）に対して、
+
+  * 日本語・英語の両方の見出し辞書
+  * 正規表現 + 類似度（例: cosine / Jaccard）でロバストに抽出
+* KAM は監査報告書（PDF または HTML）のパターンから抽出（箇条書き優先）。
+
+---
+
+## 12. Security / Compliance
+
+* 取得ファイルは社内利用限定。`source.hashes` でトレーサビリティ確保。
+* 個人名等が含まれる場合、NFAL 後段での公開出力ではマスキング方針を適用。
+
+---
+
+## 13. Tests
+
+* 単体: フィルタ/グループ/代表選定のロジック（ダミーデータ）
+* 結合: 実在の EDINET コードでのスモークテスト（レート制御有り）
+* 回帰: 訂正報告が複数回の銘柄で、代表選定が常に最新版になるか
+
+---
+
+## 14. Future Work
+
+* `type=2`（PDF）もオプション保存
+* 四半期/半期/臨報の拡張（docTypeCode: 130/140/150）
+* 監査報告書（jpaud-\*）テキストブロックの直接抽出
+* `index.json` に差分サマリのプリコンピュートを追加
+
+---
+
+## 15. Acceptance Criteria
+
+* 入力に EDINET コードを与え、**通信成功時**に `output/<E_CODE>/yuho_latest.json` が生成される
+* `index.json` に候補全件（フィルタ後）と、代表2件の `docID`・`periodEnd` が記録されている
+* `amendFlag` を考慮し、同一期の最新提出が代表に選ばれる
+* previous が存在しない場合は、その旨が `index.json` に明記される
