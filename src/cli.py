@@ -2,13 +2,15 @@ import argparse
 
 from .edinet.fetch import fetch_command
 
+DEFAULT_PROG = "nfal"
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="codexcli", description="NFAL command line tools")
-    subparsers = parser.add_subparsers(dest="command")
+
+def build_parser(prog: str = DEFAULT_PROG) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=prog, description="NFAL command line tools")
+    subparsers = parser.add_subparsers(dest="command", required=True)
 
     edinet_parser = subparsers.add_parser("edinet", help="EDINET related utilities")
-    edinet_subparsers = edinet_parser.add_subparsers(dest="edinet_command")
+    edinet_subparsers = edinet_parser.add_subparsers(dest="edinet_command", required=True)
 
     fetch_parser = edinet_subparsers.add_parser("fetch", help="Fetch securities reports")
     fetch_parser.add_argument("--edinet", required=True, help="EDINET code (e.g. E05907)")
