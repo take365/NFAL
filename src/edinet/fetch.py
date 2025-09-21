@@ -13,13 +13,20 @@ import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+try:
+    import pandas as pd  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    pd = None  # type: ignore
 
 BASE_URL = "https://api.edinet-fsa.go.jp/api/v2"
 USER_AGENT = "codexcli-edinet-fetch/0.1"
 DOC_TYPE_YUHO = "120"
 DEFAULT_YEARS_BACK = 3
 DOCUMENT_LIST_TYPE = "2"
+JST = dt.timezone(dt.timedelta(hours=9))
 SECTION_KEYWORDS = {
     "managementPolicy": [
         "経営方針",
@@ -68,6 +75,209 @@ class FetchError(RuntimeError):
     pass
 
 
+CACHE_SUBDIR = os.path.join(".cache", "edinet")
+CACHE_DATA_SUFFIX = ".parquet"
+CACHE_META_SUFFIX = ".meta.json"
+CACHE_COLUMNS = ["docID", "parameterDate", "retrievedAt", "recordJSON"]
+
+
+def require_pandas():
+    if pd is None:
+        raise FetchError(
+            "pandas と pyarrow をインストールしてください (例: pip install pandas pyarrow)"
+        )
+    return pd
+
+
+class DocumentCache:
+    def __init__(self, base_dir: str, edinet_code: str, ttl_days: Optional[int]):
+        self.base_dir = Path(base_dir)
+        self.edinet_code = edinet_code
+        self.ttl_days = ttl_days
+        self._df = None
+        self._meta: Dict[str, object] = {"edinetCode": edinet_code, "dates": {}}
+        self._dirty = False
+
+    @property
+    def data_path(self) -> Path:
+        filename = f"{self.edinet_code}{CACHE_DATA_SUFFIX}"
+        return self.base_dir / filename
+
+    @property
+    def meta_path(self) -> Path:
+        filename = f"{self.edinet_code}{CACHE_META_SUFFIX}"
+        return self.base_dir / filename
+
+    def load(self) -> None:
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        pandas = require_pandas()
+        need_reset = False
+        if self.data_path.exists():
+            try:
+                self._df = pandas.read_parquet(self.data_path)
+            except Exception as exc:  # pragma: no cover - IO errors
+                raise FetchError(f"キャッシュの読み込みに失敗しました: {self.data_path}: {exc}") from exc
+        else:
+            self._df = pandas.DataFrame(columns=CACHE_COLUMNS)
+            need_reset = True
+
+        missing_columns = [col for col in CACHE_COLUMNS if col not in self._df.columns]
+        if missing_columns:
+            self._df = pandas.DataFrame(columns=CACHE_COLUMNS)
+            need_reset = True
+
+        if self.meta_path.exists():
+            try:
+                with open(self.meta_path, encoding="utf-8") as fh:
+                    self._meta = json.load(fh)
+            except json.JSONDecodeError as exc:
+                raise FetchError(f"キャッシュメタ情報の読み込みに失敗しました: {self.meta_path}: {exc}") from exc
+        else:
+            self._meta = {"edinetCode": self.edinet_code, "dates": {}}
+
+        self._dirty = need_reset
+        self._drop_expired()
+
+    def clear(self) -> None:
+        if self.data_path.exists():
+            self.data_path.unlink()
+        if self.meta_path.exists():
+            self.meta_path.unlink()
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        pandas = require_pandas()
+        self._df = pandas.DataFrame(columns=CACHE_COLUMNS)
+        self._meta = {"edinetCode": self.edinet_code, "dates": {}}
+        self._dirty = True
+
+    def is_date_cached(self, date_str: str) -> bool:
+        dates: Dict[str, Dict[str, object]] = self._meta.get("dates", {})  # type: ignore[assignment]
+        entry = dates.get(date_str)
+        if not entry:
+            return False
+        if self.ttl_days is None:
+            return True
+        fetched_at = entry.get("retrievedAt")
+        if not fetched_at:
+            return False
+        try:
+            fetched = dt.datetime.fromisoformat(str(fetched_at))
+        except ValueError:
+            return False
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=dt.timezone.utc)
+        age = dt.datetime.now(dt.timezone.utc) - fetched.astimezone(dt.timezone.utc)
+        if age > dt.timedelta(days=self.ttl_days):
+            self._remove_date(date_str)
+            return False
+        return True
+
+    def get_records_for_date(self, date_str: str) -> List[Dict[str, object]]:
+        if self._df is None:
+            self.load()
+        mask = self._df["parameterDate"] == date_str
+        subset = self._df.loc[mask, "recordJSON"]
+        if subset.empty:
+            return []
+        return [json.loads(text) for text in subset.astype(str).tolist()]
+
+    def update_date(self, date_str: str, records: List[Dict[str, object]], *, retrieved_at: dt.datetime) -> None:
+        if self._df is None:
+            self.load()
+        pandas = require_pandas()
+        if records:
+            frame = pandas.DataFrame(
+                [
+                    {
+                        "docID": str(record.get("docID", "")),
+                        "parameterDate": date_str,
+                        "retrievedAt": retrieved_at.isoformat(),
+                        "recordJSON": json.dumps(record, ensure_ascii=False),
+                    }
+                    for record in records
+                ]
+            )
+        else:
+            frame = pandas.DataFrame(columns=CACHE_COLUMNS)
+
+        if not frame.empty:
+            self._df = pandas.concat([self._df, frame], ignore_index=True)
+            self._df.sort_values("retrievedAt", inplace=True)
+            self._df.drop_duplicates(subset=["docID"], keep="last", inplace=True)
+            self._df.reset_index(drop=True, inplace=True)
+        self._meta.setdefault("dates", {})[date_str] = {
+            "retrievedAt": retrieved_at.isoformat(),
+            "recordCount": len(records),
+        }
+        self._dirty = True
+
+    def save(self) -> None:
+        if not self._dirty:
+            return
+        pandas = require_pandas()
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            if self._df is None:
+                self._df = pandas.DataFrame(columns=CACHE_COLUMNS)
+            self._df.to_parquet(self.data_path, index=False)
+        except ImportError as exc:  # pragma: no cover - optional engine missing
+            raise FetchError("Parquet が利用できません。pyarrow もしくは fastparquet をインストールしてください。") from exc
+        except Exception as exc:  # pragma: no cover - IO errors
+            raise FetchError(f"キャッシュの保存に失敗しました: {self.data_path}: {exc}") from exc
+
+        with open(self.meta_path, "w", encoding="utf-8") as fh:
+            json.dump(self._meta, fh, ensure_ascii=False, indent=2)
+        self._dirty = False
+
+    def _remove_date(self, date_str: str) -> None:
+        if self._df is not None:
+            pandas = require_pandas()
+            mask = self._df["parameterDate"] != date_str
+            self._df = pandas.DataFrame(self._df.loc[mask]).reset_index(drop=True)
+        dates: Dict[str, Dict[str, object]] = self._meta.get("dates", {})  # type: ignore[assignment]
+        if date_str in dates:
+            dates.pop(date_str)
+        self._dirty = True
+
+    def _drop_expired(self) -> None:
+        dates: Dict[str, Dict[str, object]] = self._meta.get("dates", {})  # type: ignore[assignment]
+        expired = []
+        if self.ttl_days is None:
+            return
+        for date_str, entry in list(dates.items()):
+            fetched_at = entry.get("retrievedAt")
+            if not fetched_at:
+                expired.append(date_str)
+                continue
+            try:
+                fetched = dt.datetime.fromisoformat(str(fetched_at))
+            except ValueError:
+                expired.append(date_str)
+                continue
+            if fetched.tzinfo is None:
+                fetched = fetched.replace(tzinfo=dt.timezone.utc)
+            age = dt.datetime.now(dt.timezone.utc) - fetched.astimezone(dt.timezone.utc)
+            if age > dt.timedelta(days=self.ttl_days):
+                expired.append(date_str)
+        for date_str in expired:
+            self._remove_date(date_str)
+
+
+def purge_cache_files(base_dir: str, edinet_code: str) -> None:
+    base_path = Path(base_dir)
+    for suffix in (CACHE_DATA_SUFFIX, CACHE_META_SUFFIX):
+        target = base_path / f"{edinet_code}{suffix}"
+        if target.exists():
+            target.unlink()
+
+
+def filing_output_dirname(filing: Filing) -> str:
+    if filing.submit_time:
+        submit = filing.submit_time.astimezone(JST)
+        prefix = submit.date().strftime("%Y%m%d")
+        return f"{prefix}_{filing.doc_id}"
+    return filing.doc_id
+
+
 def fetch_command(args: argparse.Namespace) -> int:
     edinet_code = args.edinet.upper().strip()
     if not re.fullmatch(r"E\d{5}", edinet_code):
@@ -79,7 +289,28 @@ def fetch_command(args: argparse.Namespace) -> int:
     if date_from > date_to:
         raise FetchError("--from must be on or before --to")
 
-    results, list_queries = fetch_document_list(api_key, edinet_code, date_from, date_to)
+    cache = None
+    cache_dir = args.cache_dir or os.path.join(args.outdir, CACHE_SUBDIR)
+    if args.no_cache:
+        if args.clear_cache:
+            purge_cache_files(cache_dir, edinet_code)
+    else:
+        cache = DocumentCache(cache_dir, edinet_code, ttl_days=args.cache_ttl)
+        if args.clear_cache:
+            cache.clear()
+        else:
+            cache.load()
+
+    results, list_queries = fetch_document_list(
+        api_key,
+        edinet_code,
+        date_from,
+        date_to,
+        cache=cache,
+        use_cache=not args.no_cache,
+    )
+    if cache is not None:
+        cache.save()
     selected = select_latest_filings(results, prefer=args.prefer)
     if not selected:
         raise FetchError("No securities reports found for given criteria")
@@ -97,7 +328,8 @@ def fetch_command(args: argparse.Namespace) -> int:
     ordered = sorted(selected, key=lambda f: sort_key_for_period(f), reverse=True)
     labels = ["yuho_latest.json", "yuho_previous.json"]
     for filing, filename in zip(ordered, labels):
-        doc_dir = os.path.join(out_base, filing.doc_id)
+        dir_name = filing_output_dirname(filing)
+        doc_dir = os.path.join(out_base, dir_name)
         os.makedirs(doc_dir, exist_ok=True)
         payload, hashes = build_payload(api_key, filing, list_reference, doc_dir)
         output_path = os.path.join(out_base, filename)
@@ -112,7 +344,7 @@ def fetch_command(args: argparse.Namespace) -> int:
                 "submitDateTime": datetime_to_iso(filing.submit_time),
                 "consolidatedFlag": filing.consolidated,
                 "output": filename,
-                "documentDir": filing.doc_id,
+                "documentDir": dir_name,
                 "hashes": hashes,
             }
         )
@@ -185,6 +417,9 @@ def fetch_document_list(
     edinet_code: str,
     start: dt.date,
     end: dt.date,
+    *,
+    cache: Optional[DocumentCache] = None,
+    use_cache: bool,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, str]]]:
     collected: List[Dict[str, object]] = []
     queries: List[Dict[str, str]] = []
@@ -194,15 +429,34 @@ def fetch_document_list(
             "date": current_date.isoformat(),
             "type": DOCUMENT_LIST_TYPE,
         }
-        queries.append(params.copy())
-        url = f"{BASE_URL}/documents.json?{urllib.parse.urlencode(params)}"
-        payload = http_get(url, api_key, accept="application/json")
-        data = decode_json(payload)
+        query_info = params.copy()
 
-        for record in data.get("results", []):
-            if str(record.get("edinetCode", "")) != edinet_code:
-                continue
-            collected.append(record)
+        records_for_day: List[Dict[str, object]] = []
+        used_cache = False
+
+        if use_cache and cache is not None and cache.is_date_cached(params["date"]):
+            records_for_day = cache.get_records_for_date(params["date"])
+            used_cache = True
+
+        if not used_cache:
+            url = f"{BASE_URL}/documents.json?{urllib.parse.urlencode(params)}"
+            payload = http_get(url, api_key, accept="application/json")
+            data = decode_json(payload)
+            records_for_day = [
+                record
+                for record in data.get("results", [])
+                if str(record.get("edinetCode", "")).upper() == edinet_code
+            ]
+            if cache is not None and use_cache:
+                cache.update_date(
+                    params["date"],
+                    records_for_day,
+                    retrieved_at=dt.datetime.now(dt.timezone.utc),
+                )
+
+        collected.extend(records_for_day)
+        query_info["source"] = "cache" if used_cache else "api"
+        queries.append(query_info)
 
         if has_enough_periods(collected):
             break
